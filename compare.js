@@ -16,11 +16,15 @@ function parseArgs() {
   const args = process.argv.slice(2);
 
   if (args.length < 4) {
-    console.error('Usage: node compare-athena-tables.js <tableA> <tableB> <join_columns_file> <compare_columns_file> [workgroup] [filter]');
+    console.error('Usage: node compare-athena-tables.js <tableA> <tableB> <join_columns_file> <compare_columns_file> [workgroup] [filter] [--no-adjustment]');
     console.error('Example: node compare-athena-tables.js database_x.table_a database_y.table_b join_cols.txt compare_cols.txt primary "date >= DATE \'2024-01-01\'"');
     console.error('Note: Tables should be in format "database.table" (e.g., X.A means database X, table A)');
+    console.error('Note: Adjustment filtering is ON by default. Use --no-adjustment to disable.');
     process.exit(1);
   }
+
+  // Check if last argument is --no-adjustment flag
+  const skipAdjustment = args[6] === '--no-adjustment';
 
   return {
     tableA: args[0],
@@ -28,7 +32,8 @@ function parseArgs() {
     joinColumnsFile: args[2],
     compareColumnsFile: args[3],
     workgroup: args[4] || 'primary',
-    filter: args[5] || null
+    filter: args[5] || null,
+    skipAdjustment: skipAdjustment
   };
 }
 
@@ -79,7 +84,7 @@ function executeAwsCommand(args) {
 }
 
 // Build the comparison SQL query
-function buildComparisonQuery(tableA, tableB, joinColumns, compareColumns, filter = null) {
+function buildComparisonQuery(tableA, tableB, joinColumns, compareColumns, filter = null, skipAdjustment = false) {
   const joinColumnsStr = joinColumns.join(', ');
   const joinCondition = joinColumns.map(col => `tbl_a.${col} = tbl_b.${col}`).join(' AND ');
   const joinConditionLeft = joinColumns.map(col => `tbl_a.${col} = duplicates_a.${col}`).join(' AND ');
@@ -87,6 +92,13 @@ function buildComparisonQuery(tableA, tableB, joinColumns, compareColumns, filte
 
   // Build filter clause for CTEs
   const filterClauseWhere = filter ? `WHERE ${filter}` : '';
+
+  // Extract table name from tableA (format: database.table)
+  const tableAName = tableA.split('.')[1];
+  const adjustmentTable = `ecidtas_adjustment_data.${tableAName}`;
+
+  // Build adjustment join condition
+  const adjustmentJoinCondition = joinColumns.map(col => `tbl_source.${col} = adj.${col}`).join(' AND ');
 
   // For Union 4: Create a condensed diff_columns output instead of individual CASE statements
   // This dramatically reduces query length
@@ -97,6 +109,15 @@ function buildComparisonQuery(tableA, tableB, joinColumns, compareColumns, filte
   }).join(',\n      ');
 
   const compareColumnsNull = compareColumns.map(col => `NULL AS ${col}`).join(', ');
+
+  // Build adjustment CTE if adjustment filtering is enabled
+  const adjustmentCTE = skipAdjustment ? '' : `,
+-- Filter adjustment table
+filtered_adjustment AS (
+  SELECT ${joinColumnsStr}
+  FROM ${adjustmentTable}
+  ${filterClauseWhere}
+)`;
 
   const query = `
 -- Filter tables BEFORE any joins or comparisons
@@ -120,7 +141,7 @@ duplicates_b AS (
   FROM filtered_b
   GROUP BY ${joinColumnsStr}
   HAVING COUNT(*) > 1
-)
+)${adjustmentCTE}
 
 -- Union 1: Records in A but not in B
 SELECT
@@ -135,7 +156,11 @@ WHERE NOT EXISTS (
 AND NOT EXISTS (
   SELECT 1 FROM duplicates_a
   WHERE ${joinConditionLeft}
-)
+)${skipAdjustment ? '' : `
+AND NOT EXISTS (
+  SELECT 1 FROM filtered_adjustment adj
+  WHERE ${joinColumns.map(col => `tbl_a.${col} = adj.${col}`).join(' AND ')}
+)`}
 
 UNION ALL
 
@@ -152,7 +177,11 @@ WHERE NOT EXISTS (
 AND NOT EXISTS (
   SELECT 1 FROM duplicates_b
   WHERE ${joinConditionRight}
-)
+)${skipAdjustment ? '' : `
+AND NOT EXISTS (
+  SELECT 1 FROM filtered_adjustment adj
+  WHERE ${joinColumns.map(col => `tbl_b.${col} = adj.${col}`).join(' AND ')}
+)`}
 
 UNION ALL
 
@@ -165,7 +194,11 @@ FROM filtered_a tbl_a
 WHERE EXISTS (
   SELECT 1 FROM duplicates_a
   WHERE ${joinConditionLeft}
-)
+)${skipAdjustment ? '' : `
+AND NOT EXISTS (
+  SELECT 1 FROM filtered_adjustment adj
+  WHERE ${joinColumns.map(col => `tbl_a.${col} = adj.${col}`).join(' AND ')}
+)`}
 
 UNION ALL
 
@@ -178,7 +211,11 @@ FROM filtered_b tbl_b
 WHERE EXISTS (
   SELECT 1 FROM duplicates_b
   WHERE ${joinConditionRight}
-)
+)${skipAdjustment ? '' : `
+AND NOT EXISTS (
+  SELECT 1 FROM filtered_adjustment adj
+  WHERE ${joinColumns.map(col => `tbl_b.${col} = adj.${col}`).join(' AND ')}
+)`}
 
 UNION ALL
 
@@ -201,7 +238,11 @@ WHERE NOT EXISTS (
 AND NOT EXISTS (
   SELECT 1 FROM duplicates_b
   WHERE ${joinConditionRight}
-)
+)${skipAdjustment ? '' : `
+AND NOT EXISTS (
+  SELECT 1 FROM filtered_adjustment adj
+  WHERE ${joinColumns.map(col => `tbl_a.${col} = adj.${col}`).join(' AND ')}
+)`}
 AND (
   ${compareColumns.map(col => `tbl_a.${col} != tbl_b.${col} OR (tbl_a.${col} IS NULL AND tbl_b.${col} IS NOT NULL) OR (tbl_a.${col} IS NOT NULL AND tbl_b.${col} IS NULL)`).join('\n  OR ')}
 )
@@ -470,6 +511,11 @@ async function main() {
     if (config.filter) {
       console.log(`  Filter: ${config.filter}`);
     }
+    console.log(`  Adjustment Filtering: ${config.skipAdjustment ? 'OFF' : 'ON'}`);
+    if (!config.skipAdjustment) {
+      const tableAName = config.tableA.split('.')[1];
+      console.log(`  Adjustment Table: ecidtas_adjustment_data.${tableAName}`);
+    }
     console.log('');
 
     // Read column files
@@ -487,7 +533,8 @@ async function main() {
       config.tableB,
       joinColumns,
       compareColumns,
-      config.filter
+      config.filter,
+      config.skipAdjustment
     );
 
     console.log('Generated SQL Query:');

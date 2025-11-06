@@ -10,13 +10,16 @@ This is a Node.js CLI tool that compares two AWS Athena tables to identify diffe
 
 ```bash
 # Basic usage
-node compare-athena-tables.js database_x.table_a database_y.table_b join_columns.txt compare_columns.txt
+node compare.js database_x.table_a database_y.table_b join_columns.txt compare_columns.txt
 
 # With workgroup
-node compare-athena-tables.js database_x.table_a database_y.table_b join_columns.txt compare_columns.txt my_workgroup
+node compare.js database_x.table_a database_y.table_b join_columns.txt compare_columns.txt my_workgroup
 
 # With filter
-node compare-athena-tables.js database_x.table_a database_y.table_b join_columns.txt compare_columns.txt primary "date >= DATE '2024-01-01'"
+node compare.js database_x.table_a database_y.table_b join_columns.txt compare_columns.txt primary "date >= DATE '2024-01-01'"
+
+# Disable adjustment filtering (by default, adjustment filtering is ON)
+node compare.js database_x.table_a database_y.table_b join_columns.txt compare_columns.txt primary "date >= DATE '2024-01-01'" --no-adjustment
 ```
 
 Arguments:
@@ -25,6 +28,7 @@ Arguments:
 - `compare_columns_file`: Text file with one column name per line (columns to compare values)
 - `workgroup` (optional): Athena workgroup name (default: "primary")
 - `filter` (optional): SQL WHERE clause applied to all unions
+- `--no-adjustment` (optional): Disable adjustment table filtering (default: filtering is ON)
 
 ## Architecture
 
@@ -36,6 +40,26 @@ The tool generates a complex SQL query with 4 UNION ALL components:
 2. **Union 2**: Records in Table B but not in Table A (excluding duplicates) - marked as "missing in table A"
 3. **Union 3a/3b**: All duplicate keys from both tables - marked as "duplicate key in table A/B"
 4. **Union 4**: Matched records with differences - uses ARRAY_JOIN to combine all column differences into a single semicolon-separated field
+
+### Adjustment Table Filtering
+
+**NEW FEATURE**: By default, the tool automatically filters out rows that have adjustments in the adjustment table.
+
+**How it works:**
+- The adjustment table is always at `ecidtas_adjustment_data.{tableA_name}` (uses the same table name as Table A)
+- The adjustment table contains the same join columns as the comparison
+- Any row that exists in the adjustment table (based on join columns) is automatically excluded from the comparison results
+- This is because adjustments are expected to cause differences between prod and check tables
+
+**Control:**
+- **Default behavior**: Adjustment filtering is ON
+- **To disable**: Pass `--no-adjustment` as the last argument
+- When enabled, rows matching adjustment table keys are excluded from all comparison results (missing records, duplicates, and value differences)
+
+**Why this is useful:**
+- In prod vs check comparisons, adjustments are expected to cause differences
+- Filtering these out lets you focus on unexpected differences that need investigation
+- The adjustment table acts as a whitelist for expected differences
 
 ### Filter Application Strategy
 
@@ -53,18 +77,24 @@ duplicates_a AS (
 ),
 duplicates_b AS (
   SELECT join_columns FROM filtered_b GROUP BY join_columns HAVING COUNT(*) > 1
+),
+filtered_adjustment AS (
+  SELECT join_columns FROM ecidtas_adjustment_data.{tableA_name} WHERE ${filter}
 )
--- All subsequent unions use filtered_a, filtered_b, duplicates_a, duplicates_b
+-- All subsequent unions use filtered_a, filtered_b, duplicates_a, duplicates_b, filtered_adjustment
 ```
 
 This approach ensures:
 - Both tables are filtered once at the beginning (performance optimization)
+- The adjustment table is also filtered with the same WHERE clause
 - All subsequent operations (joins, duplicate detection, comparisons) work on pre-filtered data
 - Duplicate detection is performed on filtered datasets
+- Rows in adjustment table are excluded from results (unless --no-adjustment is passed)
 - No need to repeat filter logic across multiple unions
 
 ### Key Implementation Details
 
+- **Adjustment Filtering**: Automatically excludes rows that exist in the adjustment table (default behavior, disable with `--no-adjustment`)
 - **Duplicate Detection**: Uses subqueries with `COUNT(*) > 1` grouped by join columns
 - **Value Comparison**: Uses ARRAY_JOIN with IF expressions to create a condensed diff_columns output (format: "col1:valueA X valueB; col2:valueA X valueB")
 - **Query Optimization**: Query uses single diff_columns field to dramatically reduce query length (avoids Athena input length limits for tables with many comparison columns)
@@ -113,6 +143,14 @@ Compare column format:
 
 ## Configuration
 
-Located in `compare-athena-tables.js:CONFIG`:
+Located in `compare.js:CONFIG`:
 - `pollInterval: 2000` - Query status check interval (milliseconds)
 - `maxRetries: 300` - Maximum polling attempts (10 minutes total)
+
+## Adjustment Table
+
+The adjustment table feature allows you to filter out expected differences:
+- **Table location**: Always at `ecidtas_adjustment_data.{tableA_name}`
+- **Structure**: Must contain the same join columns as the comparison tables
+- **Filtering**: Default ON, use `--no-adjustment` to disable
+- **Use case**: When comparing prod vs check tables with known adjustments applied to prod
