@@ -81,9 +81,9 @@ function executeAwsCommand(args) {
 // Build the comparison SQL query
 function buildComparisonQuery(tableA, tableB, joinColumns, compareColumns, filter = null) {
   const joinColumnsStr = joinColumns.join(', ');
-  const joinCondition = joinColumns.map(col => `a.${col} = b.${col}`).join(' AND ');
-  const joinConditionLeft = joinColumns.map(col => `a.${col} = duplicates_a.${col}`).join(' AND ');
-  const joinConditionRight = joinColumns.map(col => `b.${col} = duplicates_b.${col}`).join(' AND ');
+  const joinCondition = joinColumns.map(col => `tbl_a.${col} = tbl_b.${col}`).join(' AND ');
+  const joinConditionLeft = joinColumns.map(col => `tbl_a.${col} = duplicates_a.${col}`).join(' AND ');
+  const joinConditionRight = joinColumns.map(col => `tbl_b.${col} = duplicates_b.${col}`).join(' AND ');
 
   // Build filter clause for CTEs
   const filterClauseWhere = filter ? `WHERE ${filter}` : '';
@@ -92,8 +92,8 @@ function buildComparisonQuery(tableA, tableB, joinColumns, compareColumns, filte
   // This dramatically reduces query length
   // Use COALESCE to display 'NULL' string instead of NULL values in output
   const diffColumnsArray = compareColumns.map(col => {
-    return `IF(a.${col} = b.${col} OR (a.${col} IS NULL AND b.${col} IS NULL), NULL,
-      CONCAT('${col}:', COALESCE(CAST(a.${col} AS VARCHAR), 'NULL'), ' X ', COALESCE(CAST(b.${col} AS VARCHAR), 'NULL')))`;
+    return `IF(tbl_a.${col} = tbl_b.${col} OR (tbl_a.${col} IS NULL AND tbl_b.${col} IS NULL), NULL,
+      CONCAT('${col}:', COALESCE(CAST(tbl_a.${col} AS VARCHAR), 'NULL'), ' X ', COALESCE(CAST(tbl_b.${col} AS VARCHAR), 'NULL')))`;
   }).join(',\n      ');
 
   const compareColumnsNull = compareColumns.map(col => `NULL AS ${col}`).join(', ');
@@ -124,12 +124,12 @@ duplicates_b AS (
 
 -- Union 1: Records in A but not in B
 SELECT
-  ${joinColumns.map(col => `a.${col}`).join(', ')},
+  ${joinColumns.map(col => `tbl_a.${col}`).join(', ')},
   'missing in ${tableB}' AS remarks,
   NULL AS diff_columns
-FROM filtered_a a
+FROM filtered_a tbl_a
 WHERE NOT EXISTS (
-  SELECT 1 FROM filtered_b b
+  SELECT 1 FROM filtered_b tbl_b
   WHERE ${joinCondition}
 )
 AND NOT EXISTS (
@@ -141,12 +141,12 @@ UNION ALL
 
 -- Union 2: Records in B but not in A
 SELECT
-  ${joinColumns.map(col => `b.${col}`).join(', ')},
+  ${joinColumns.map(col => `tbl_b.${col}`).join(', ')},
   'missing in ${tableA}' AS remarks,
   NULL AS diff_columns
-FROM filtered_b b
+FROM filtered_b tbl_b
 WHERE NOT EXISTS (
-  SELECT 1 FROM filtered_a a
+  SELECT 1 FROM filtered_a tbl_a
   WHERE ${joinCondition}
 )
 AND NOT EXISTS (
@@ -158,10 +158,10 @@ UNION ALL
 
 -- Union 3a: Duplicate keys in table A
 SELECT
-  ${joinColumns.map(col => `a.${col}`).join(', ')},
+  ${joinColumns.map(col => `tbl_a.${col}`).join(', ')},
   'duplicate key in ${tableA}' AS remarks,
   NULL AS diff_columns
-FROM filtered_a a
+FROM filtered_a tbl_a
 WHERE EXISTS (
   SELECT 1 FROM duplicates_a
   WHERE ${joinConditionLeft}
@@ -171,10 +171,10 @@ UNION ALL
 
 -- Union 3b: Duplicate keys in table B
 SELECT
-  ${joinColumns.map(col => `b.${col}`).join(', ')},
+  ${joinColumns.map(col => `tbl_b.${col}`).join(', ')},
   'duplicate key in ${tableB}' AS remarks,
   NULL AS diff_columns
-FROM filtered_b b
+FROM filtered_b tbl_b
 WHERE EXISTS (
   SELECT 1 FROM duplicates_b
   WHERE ${joinConditionRight}
@@ -184,7 +184,7 @@ UNION ALL
 
 -- Union 4: Matched records with column differences
 SELECT
-  ${joinColumns.map(col => `a.${col}`).join(', ')},
+  ${joinColumns.map(col => `tbl_a.${col}`).join(', ')},
   'matched' AS remarks,
   ARRAY_JOIN(
     ARRAY[
@@ -192,8 +192,8 @@ SELECT
     ],
     '; '
   ) AS diff_columns
-FROM filtered_a a
-INNER JOIN filtered_b b ON ${joinCondition}
+FROM filtered_a tbl_a
+INNER JOIN filtered_b tbl_b ON ${joinCondition}
 WHERE NOT EXISTS (
   SELECT 1 FROM duplicates_a
   WHERE ${joinConditionLeft}
@@ -203,7 +203,7 @@ AND NOT EXISTS (
   WHERE ${joinConditionRight}
 )
 AND (
-  ${compareColumns.map(col => `a.${col} != b.${col} OR (a.${col} IS NULL AND b.${col} IS NOT NULL) OR (a.${col} IS NOT NULL AND b.${col} IS NULL)`).join('\n  OR ')}
+  ${compareColumns.map(col => `tbl_a.${col} != tbl_b.${col} OR (tbl_a.${col} IS NULL AND tbl_b.${col} IS NOT NULL) OR (tbl_a.${col} IS NOT NULL AND tbl_b.${col} IS NULL)`).join('\n  OR ')}
 )
 
 ORDER BY ${joinColumnsStr}
