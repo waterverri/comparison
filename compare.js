@@ -4,6 +4,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs').promises;
 const path = require('path');
+const { pathToFileURL } = require('url');
 
 // Configuration
 const CONFIG = {
@@ -264,10 +265,15 @@ async function startQueryExecution(query, workgroup) {
   await fs.writeFile(tempQueryFile, query, 'utf-8');
 
   try {
+    // Convert path to file:// URI (works on both Windows and Unix)
+    // Windows: C:\path\file.sql -> file:///C:/path/file.sql
+    // Unix: /path/file.sql -> file:///path/file.sql
+    const fileUri = pathToFileURL(tempQueryFile).href;
+
     const args = [
       'athena',
       'start-query-execution',
-      '--query-string', `file://${tempQueryFile}`,
+      '--query-string', fileUri,
       '--work-group', workgroup
     ];
 
