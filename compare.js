@@ -90,9 +90,10 @@ function buildComparisonQuery(tableA, tableB, joinColumns, compareColumns, filte
 
   // For Union 4: Create a condensed diff_columns output instead of individual CASE statements
   // This dramatically reduces query length
+  // Use COALESCE to display 'NULL' string instead of NULL values in output
   const diffColumnsArray = compareColumns.map(col => {
     return `IF(a.${col} = b.${col} OR (a.${col} IS NULL AND b.${col} IS NULL), NULL,
-      CONCAT('${col}:', CAST(a.${col} AS VARCHAR), ' X ', CAST(b.${col} AS VARCHAR)))`;
+      CONCAT('${col}:', COALESCE(CAST(a.${col} AS VARCHAR), 'NULL'), ' X ', COALESCE(CAST(b.${col} AS VARCHAR), 'NULL')))`;
   }).join(',\n      ');
 
   const compareColumnsNull = compareColumns.map(col => `NULL AS ${col}`).join(', ');
