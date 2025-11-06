@@ -88,13 +88,12 @@ function buildComparisonQuery(tableA, tableB, joinColumns, compareColumns, filte
   // Build filter clause for CTEs
   const filterClauseWhere = filter ? `WHERE ${filter}` : '';
 
-  // Build comparison columns for union 4
-  const compareColumnsSelect = compareColumns.map(col => {
-    return `CASE
-      WHEN a.${col} = b.${col} OR (a.${col} IS NULL AND b.${col} IS NULL) THEN NULL
-      ELSE CONCAT(CAST(a.${col} AS VARCHAR), ' X ', CAST(b.${col} AS VARCHAR))
-    END AS ${col}`;
-  }).join(',\n    ');
+  // For Union 4: Create a condensed diff_columns output instead of individual CASE statements
+  // This dramatically reduces query length
+  const diffColumnsArray = compareColumns.map(col => {
+    return `IF(a.${col} = b.${col} OR (a.${col} IS NULL AND b.${col} IS NULL), NULL,
+      CONCAT('${col}:', CAST(a.${col} AS VARCHAR), ' X ', CAST(b.${col} AS VARCHAR)))`;
+  }).join(',\n      ');
 
   const compareColumnsNull = compareColumns.map(col => `NULL AS ${col}`).join(', ');
 
@@ -124,9 +123,9 @@ duplicates_b AS (
 
 -- Union 1: Records in A but not in B
 SELECT
-  ${joinColumnsStr},
+  ${joinColumns.map(col => `a.${col}`).join(', ')},
   'missing in ${tableB}' AS remarks,
-  ${compareColumnsNull}
+  NULL AS diff_columns
 FROM filtered_a a
 WHERE NOT EXISTS (
   SELECT 1 FROM filtered_b b
@@ -141,9 +140,9 @@ UNION ALL
 
 -- Union 2: Records in B but not in A
 SELECT
-  ${joinColumnsStr},
+  ${joinColumns.map(col => `b.${col}`).join(', ')},
   'missing in ${tableA}' AS remarks,
-  ${compareColumnsNull}
+  NULL AS diff_columns
 FROM filtered_b b
 WHERE NOT EXISTS (
   SELECT 1 FROM filtered_a a
@@ -158,35 +157,40 @@ UNION ALL
 
 -- Union 3a: Duplicate keys in table A
 SELECT
-  ${joinColumnsStr},
+  ${joinColumns.map(col => `a.${col}`).join(', ')},
   'duplicate key in ${tableA}' AS remarks,
-  ${compareColumnsNull}
-FROM filtered_a
-WHERE (${joinColumnsStr}) IN (
-  SELECT ${joinColumnsStr}
-  FROM duplicates_a
+  NULL AS diff_columns
+FROM filtered_a a
+WHERE EXISTS (
+  SELECT 1 FROM duplicates_a
+  WHERE ${joinConditionLeft}
 )
 
 UNION ALL
 
 -- Union 3b: Duplicate keys in table B
 SELECT
-  ${joinColumnsStr},
+  ${joinColumns.map(col => `b.${col}`).join(', ')},
   'duplicate key in ${tableB}' AS remarks,
-  ${compareColumnsNull}
-FROM filtered_b
-WHERE (${joinColumnsStr}) IN (
-  SELECT ${joinColumnsStr}
-  FROM duplicates_b
+  NULL AS diff_columns
+FROM filtered_b b
+WHERE EXISTS (
+  SELECT 1 FROM duplicates_b
+  WHERE ${joinConditionRight}
 )
 
 UNION ALL
 
 -- Union 4: Matched records with column differences
 SELECT
-  a.${joinColumns.map(col => col).join(', a.')},
+  ${joinColumns.map(col => `a.${col}`).join(', a.')},
   'matched' AS remarks,
-  ${compareColumnsSelect}
+  ARRAY_JOIN(
+    ARRAY[
+      ${diffColumnsArray}
+    ],
+    '; '
+  ) AS diff_columns
 FROM filtered_a a
 INNER JOIN filtered_b b ON ${joinCondition}
 WHERE NOT EXISTS (
