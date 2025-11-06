@@ -103,6 +103,7 @@ This approach ensures:
 - **NULL Handling**: Treats NULL values as equal when comparing (`a.col = b.col OR (a.col IS NULL AND b.col IS NULL)`)
 - **Tuple Comparison Fix**: Uses `EXISTS` instead of `WHERE (columns) IN (SELECT columns)` to avoid TYPE_MISMATCH errors in Athena
 - **AWS Integration**: Uses `child_process.spawn()` to execute AWS CLI commands, parsing JSON responses
+- **Command-Line Safety**: Writes queries to temporary files and uses `file://` URI protocol to avoid OS command-line length limits (ENAMETOOLONG errors). Works cross-platform (Windows, Linux, macOS).
 
 ### Bisection Strategy for Query Length Limits
 
