@@ -124,9 +124,12 @@ This approach ensures:
 **Example:**
 - If you have 500 comparison columns and the query exceeds the limit:
   - Split 1: [250 columns] + [250 columns]
-  - If still too long, split again: [125] + [125] + [125] + [125]
-  - Execute 4 separate queries
-  - Merge all 4 results into final CSV
+  - Check first half [250]: If still too long → split to [125] + [125]
+  - Check second half [250]: If within limit → execute directly
+  - Result: [125, 125, 250] - asymmetric splitting based on actual query length
+  - Execute 3 separate queries and merge results
+
+Note: Splits are asymmetric - each half is independently checked and only split further if needed. This handles cases where column names have varying lengths.
 
 **Benefits:**
 - No manual intervention needed - splitting happens automatically
