@@ -4,7 +4,6 @@
 const { spawn } = require('child_process');
 const fs = require('fs').promises;
 const path = require('path');
-const { pathToFileURL } = require('url');
 
 // Configuration
 const CONFIG = {
