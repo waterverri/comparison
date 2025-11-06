@@ -258,15 +258,25 @@ ORDER BY ${joinColumnsStr}
 async function startQueryExecution(query, workgroup) {
   console.log('Starting Athena query execution...');
 
-  const args = [
-    'athena',
-    'start-query-execution',
-    '--query-string', query,
-    '--work-group', workgroup
-  ];
+  // Write query to temp file to avoid command-line length limits (ENAMETOOLONG)
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const tempQueryFile = path.resolve(`temp_query_${timestamp}.sql`);
+  await fs.writeFile(tempQueryFile, query, 'utf-8');
 
-  const result = await executeAwsCommand(args);
-  return result.QueryExecutionId;
+  try {
+    const args = [
+      'athena',
+      'start-query-execution',
+      '--query-string', `file://${tempQueryFile}`,
+      '--work-group', workgroup
+    ];
+
+    const result = await executeAwsCommand(args);
+    return result.QueryExecutionId;
+  } finally {
+    // Clean up temp file
+    await fs.unlink(tempQueryFile).catch(() => {});
+  }
 }
 
 // Poll query status
