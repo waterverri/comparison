@@ -8,7 +8,8 @@ const path = require('path');
 // Configuration
 const CONFIG = {
   pollInterval: 2000, // 2 seconds
-  maxRetries: 300 // 10 minutes max wait time
+  maxRetries: 300, // 10 minutes max wait time
+  maxQueryLength: 250000 // Athena max is 256KB, use 250KB for safety
 };
 
 // Parse command line arguments
@@ -496,6 +497,205 @@ async function downloadResultsFromS3(queryExecution, outputFile) {
   console.log(`Results saved to: ${outputFile}`);
 }
 
+// Check if query length exceeds Athena limit
+function isQueryTooLong(query) {
+  const queryLength = Buffer.byteLength(query, 'utf-8');
+  console.log(`Query length: ${queryLength.toLocaleString()} bytes`);
+  return queryLength > CONFIG.maxQueryLength;
+}
+
+// Execute query with a subset of comparison columns and return raw CSV content
+async function executeQueryWithSubset(config, joinColumns, compareColumnsSubset, subsetIndex, totalSubsets) {
+  console.log(`\n=== Executing query for column subset ${subsetIndex}/${totalSubsets} ===`);
+  console.log(`Columns in this subset: ${compareColumnsSubset.join(', ')}`);
+
+  const query = buildComparisonQuery(
+    config.tableA,
+    config.tableB,
+    joinColumns,
+    compareColumnsSubset,
+    config.filter,
+    config.skipAdjustment
+  );
+
+  if (isQueryTooLong(query)) {
+    throw new Error('QUERY_TOO_LONG');
+  }
+
+  console.log('Generated SQL Query:');
+  console.log('-------------------');
+  console.log(query);
+  console.log('-------------------');
+  console.log('');
+
+  // Start query execution
+  const queryExecutionId = await startQueryExecution(query, config.workgroup);
+  console.log(`Query Execution ID: ${queryExecutionId}`);
+
+  // Wait for completion
+  const queryExecution = await waitForQueryCompletion(queryExecutionId);
+  console.log('');
+
+  // Download to temporary file
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const tempFile = `temp_subset_${subsetIndex}_${timestamp}.csv`;
+
+  try {
+    await downloadResultsFromS3(queryExecution, tempFile);
+  } catch (error) {
+    console.log('S3 download failed, trying direct API download...');
+    await downloadResults(queryExecutionId, tempFile);
+  }
+
+  // Expand diff_columns
+  await expandDiffColumnsInCsv(tempFile, compareColumnsSubset);
+
+  // Read and return content
+  const content = await fs.readFile(tempFile, 'utf-8');
+
+  // Clean up temp file
+  await fs.unlink(tempFile).catch(() => {});
+
+  return { content, compareColumns: compareColumnsSubset };
+}
+
+// Bisection strategy: recursively split comparison columns if query is too long
+async function executeWithBisection(config, joinColumns, compareColumns, depth = 0) {
+  const indent = '  '.repeat(depth);
+  console.log(`${indent}=== Bisection level ${depth}: ${compareColumns.length} comparison columns ===`);
+
+  // Build query to check length
+  const query = buildComparisonQuery(
+    config.tableA,
+    config.tableB,
+    joinColumns,
+    compareColumns,
+    config.filter,
+    config.skipAdjustment
+  );
+
+  // If query is within limits, execute directly
+  if (!isQueryTooLong(query)) {
+    console.log(`${indent}Query length is acceptable, executing query...`);
+    // Use depth as a simple counter for subset numbering
+    const subsetId = Date.now() + Math.random();
+    return [await executeQueryWithSubset(config, joinColumns, compareColumns, subsetId, 1)];
+  }
+
+  // Query is too long, split columns in half
+  if (compareColumns.length === 1) {
+    throw new Error(`Query is too long even with a single comparison column: ${compareColumns[0]}`);
+  }
+
+  console.log(`${indent}Query too long (${Buffer.byteLength(query, 'utf-8')} bytes), splitting columns...`);
+
+  const mid = Math.floor(compareColumns.length / 2);
+  const leftColumns = compareColumns.slice(0, mid);
+  const rightColumns = compareColumns.slice(mid);
+
+  console.log(`${indent}Splitting into: [${leftColumns.length}] + [${rightColumns.length}] columns`);
+
+  // Recursively execute both halves
+  const leftResults = await executeWithBisection(config, joinColumns, leftColumns, depth + 1);
+  const rightResults = await executeWithBisection(config, joinColumns, rightColumns, depth + 1);
+
+  return [...leftResults, ...rightResults];
+}
+
+// Merge multiple CSV results using FULL OUTER JOIN logic
+async function mergeResults(results, joinColumns, allCompareColumns, outputFile) {
+  console.log('\n=== Merging results from multiple queries ===');
+  console.log(`Total result sets to merge: ${results.length}`);
+
+  if (results.length === 0) {
+    throw new Error('No results to merge');
+  }
+
+  if (results.length === 1) {
+    // Only one result, write directly
+    await fs.writeFile(outputFile, results[0].content, 'utf-8');
+    console.log(`Single result saved to: ${outputFile}`);
+    return;
+  }
+
+  // Parse all result sets
+  const parsedResults = results.map((result, index) => {
+    const lines = result.content.split('\n').filter(line => line.trim() !== '');
+    const headers = parseCSVLine(lines[0]);
+    const rows = [];
+
+    for (let i = 1; i < lines.length; i++) {
+      const fields = parseCSVLine(lines[i]);
+      if (fields.length === headers.length) {
+        const row = {};
+        headers.forEach((header, idx) => {
+          row[header] = fields[idx];
+        });
+        rows.push(row);
+      }
+    }
+
+    return { headers, rows, compareColumns: result.compareColumns };
+  });
+
+  // Build merged row map: key = join columns + remarks
+  const mergedMap = new Map();
+
+  for (const result of parsedResults) {
+    for (const row of result.rows) {
+      // Build composite key from join columns + remarks
+      const keyParts = joinColumns.map(col => row[col] || '');
+      keyParts.push(row.remarks || '');
+      const key = keyParts.join('|||');
+
+      if (!mergedMap.has(key)) {
+        // Initialize with join columns and remarks
+        const newRow = {};
+        joinColumns.forEach(col => {
+          newRow[col] = row[col] || '';
+        });
+        newRow.remarks = row.remarks || '';
+
+        // Initialize all compare columns as empty
+        allCompareColumns.forEach(col => {
+          newRow[col] = '';
+        });
+
+        mergedMap.set(key, newRow);
+      }
+
+      // Merge compare column values
+      const mergedRow = mergedMap.get(key);
+      result.compareColumns.forEach(col => {
+        if (row[col] !== undefined && row[col] !== '') {
+          mergedRow[col] = row[col];
+        }
+      });
+    }
+  }
+
+  // Build output CSV
+  const finalHeaders = [...joinColumns, 'remarks', ...allCompareColumns];
+  const outputLines = [finalHeaders.join(',')];
+
+  // Sort by join columns for consistent output
+  const sortedEntries = Array.from(mergedMap.entries()).sort((a, b) => {
+    return a[0].localeCompare(b[0]);
+  });
+
+  for (const [, row] of sortedEntries) {
+    const fields = finalHeaders.map(header => {
+      const value = row[header] || '';
+      return escapeCSVField(value);
+    });
+    outputLines.push(fields.join(','));
+  }
+
+  await fs.writeFile(outputFile, outputLines.join('\n') + '\n', 'utf-8');
+  console.log(`Merged results saved to: ${outputFile}`);
+  console.log(`Total merged rows: ${sortedEntries.length}`);
+}
+
 // Main function
 async function main() {
   try {
@@ -524,51 +724,17 @@ async function main() {
     const compareColumns = await readColumnFile(config.compareColumnsFile);
 
     console.log(`Join columns: ${joinColumns.join(', ')}`);
-    console.log(`Compare columns: ${compareColumns.join(', ')}`);
+    console.log(`Compare columns (${compareColumns.length} total): ${compareColumns.join(', ')}`);
     console.log('');
 
-    // Build query
-    const query = buildComparisonQuery(
-      config.tableA,
-      config.tableB,
-      joinColumns,
-      compareColumns,
-      config.filter,
-      config.skipAdjustment
-    );
+    // Execute with bisection strategy (automatically splits if query is too long)
+    const results = await executeWithBisection(config, joinColumns, compareColumns);
 
-    console.log('Generated SQL Query:');
-    console.log('-------------------');
-    console.log(query);
-    console.log('-------------------');
-    console.log('');
-
-    // Start query execution
-    const queryExecutionId = await startQueryExecution(
-      query,
-      config.workgroup
-    );
-    console.log(`Query Execution ID: ${queryExecutionId}`);
-    console.log('');
-
-    // Wait for completion
-    const queryExecution = await waitForQueryCompletion(queryExecutionId);
-    console.log('');
-
-    // Download results
+    // Merge results if multiple queries were executed
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const outputFile = `comparison_results_${timestamp}.csv`;
 
-    // Try to download from S3 (more reliable for large results)
-    try {
-      await downloadResultsFromS3(queryExecution, outputFile);
-    } catch (error) {
-      console.log('S3 download failed, trying direct API download...');
-      await downloadResults(queryExecutionId, outputFile);
-    }
-
-    // Expand diff_columns into separate columns for easier reading
-    await expandDiffColumnsInCsv(outputFile, compareColumns);
+    await mergeResults(results, joinColumns, compareColumns, outputFile);
 
     console.log('');
     console.log('Comparison completed successfully!');
