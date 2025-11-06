@@ -98,20 +98,60 @@ This approach ensures:
 - **Duplicate Detection**: Uses subqueries with `COUNT(*) > 1` grouped by join columns
 - **Value Comparison**: Uses ARRAY_JOIN with IF expressions to create a condensed diff_columns output (format: "col1:valueA X valueB; col2:valueA X valueB")
 - **Query Optimization**: Query uses single diff_columns field to dramatically reduce query length (avoids Athena input length limits for tables with many comparison columns)
+- **Bisection Strategy**: Automatically handles extremely long queries by splitting comparison columns into multiple queries and merging results (see below)
 - **Output Post-Processing**: After download, the diff_columns field is automatically expanded into separate columns (one per compare column) for easier reading
 - **NULL Handling**: Treats NULL values as equal when comparing (`a.col = b.col OR (a.col IS NULL AND b.col IS NULL)`)
 - **Tuple Comparison Fix**: Uses `EXISTS` instead of `WHERE (columns) IN (SELECT columns)` to avoid TYPE_MISMATCH errors in Athena
 - **AWS Integration**: Uses `child_process.spawn()` to execute AWS CLI commands, parsing JSON responses
 
+### Bisection Strategy for Query Length Limits
+
+**NEW FEATURE**: The tool now automatically handles Athena's 256KB query length limit using a recursive bisection strategy.
+
+**How it works:**
+1. **Query Length Check**: Before executing, the tool checks if the generated query exceeds 250KB (safe threshold)
+2. **Automatic Splitting**: If too long, comparison columns are split into two equal groups
+3. **Recursive Bisection**: Each group is checked again; if still too long, it's split further
+4. **Multiple Queries**: Multiple queries are executed in sequence, each with a subset of comparison columns
+5. **Result Merging**: All partial results are merged using FULL OUTER JOIN logic in JavaScript
+
+**Merge Logic:**
+- **Join Key**: Results are merged based on join columns + remarks field
+- **Missing/Duplicate Rows**: Appear identically across all queries (same key + remarks), so they're naturally deduplicated
+- **Matched Rows**: Comparison column values from different queries are combined into the same row
+- **Output Format**: Final CSV has same structure as single-query execution
+
+**Example:**
+- If you have 500 comparison columns and the query exceeds the limit:
+  - Split 1: [250 columns] + [250 columns]
+  - If still too long, split again: [125] + [125] + [125] + [125]
+  - Execute 4 separate queries
+  - Merge all 4 results into final CSV
+
+**Benefits:**
+- No manual intervention needed - splitting happens automatically
+- Handles tables with hundreds or thousands of comparison columns
+- Final output is identical to what a single query would produce
+- Transparent to the user - final CSV format unchanged
+
 ### Execution Flow
 
 1. Parse arguments and read column configuration files
-2. Build SQL query using `buildComparisonQuery()`
-3. Start Athena query via `aws athena start-query-execution`
-4. Poll status every 2 seconds (max 10 minutes) via `aws athena get-query-execution`
-5. Download results from S3 (preferred) or via API
-6. Convert results to CSV and save with timestamp
-7. Post-process CSV: expand `diff_columns` into separate columns for each compare column
+2. Execute with bisection strategy (`executeWithBisection()`):
+   - Build SQL query with all comparison columns
+   - Check if query length exceeds 250KB limit
+   - If within limits: Execute single query
+   - If too long: Split columns recursively and execute multiple queries
+3. For each query (or subset):
+   - Start Athena query via `aws athena start-query-execution`
+   - Poll status every 2 seconds (max 10 minutes) via `aws athena get-query-execution`
+   - Download results from S3 (preferred) or via API
+   - Post-process CSV: expand `diff_columns` into separate columns
+4. Merge all results if multiple queries were executed:
+   - Use join columns + remarks as merge key
+   - Combine comparison column values from all subsets
+   - Deduplicate missing/duplicate rows
+5. Save final CSV with timestamp
 
 ### Output Format
 
@@ -146,6 +186,7 @@ Compare column format:
 Located in `compare.js:CONFIG`:
 - `pollInterval: 2000` - Query status check interval (milliseconds)
 - `maxRetries: 300` - Maximum polling attempts (10 minutes total)
+- `maxQueryLength: 250000` - Maximum query length in bytes (Athena limit is 256KB, using 250KB for safety)
 
 ## Adjustment Table
 
