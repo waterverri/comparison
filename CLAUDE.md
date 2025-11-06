@@ -35,7 +35,7 @@ The tool generates a complex SQL query with 4 UNION ALL components:
 1. **Union 1**: Records in Table A but not in Table B (excluding duplicates) - marked as "missing in table B"
 2. **Union 2**: Records in Table B but not in Table A (excluding duplicates) - marked as "missing in table A"
 3. **Union 3a/3b**: All duplicate keys from both tables - marked as "duplicate key in table A/B"
-4. **Union 4**: Matched records with column-by-column comparison - marked as "matched"
+4. **Union 4**: Matched records with differences - uses ARRAY_JOIN to combine all column differences into a single semicolon-separated field
 
 ### Filter Application Strategy
 
@@ -66,8 +66,10 @@ This approach ensures:
 ### Key Implementation Details
 
 - **Duplicate Detection**: Uses subqueries with `COUNT(*) > 1` grouped by join columns
-- **Value Comparison**: Uses CASE expressions in Union 4 to show differences as "valueA X valueB"
+- **Value Comparison**: Uses ARRAY_JOIN with IF expressions to create a condensed diff_columns output (format: "col1:valueA X valueB; col2:valueA X valueB")
+- **Query Optimization**: Changed from individual CASE columns to single diff_columns field to dramatically reduce query length for tables with many comparison columns
 - **NULL Handling**: Treats NULL values as equal when comparing (`a.col = b.col OR (a.col IS NULL AND b.col IS NULL)`)
+- **Tuple Comparison Fix**: Uses `EXISTS` instead of `WHERE (columns) IN (SELECT columns)` to avoid TYPE_MISMATCH errors in Athena
 - **AWS Integration**: Uses `child_process.spawn()` to execute AWS CLI commands, parsing JSON responses
 
 ### Execution Flow
@@ -84,7 +86,7 @@ This approach ensures:
 CSV structure:
 - First columns: Join columns (e.g., `id`, `customer_id`)
 - Next column: `remarks` (describes the type of difference)
-- Remaining columns: Compare columns (NULL if identical, "valueA X valueB" if different)
+- Last column: `diff_columns` (semicolon-separated list of differences)
 
 Remarks values:
 - `missing in schema_y.table_b`
@@ -92,6 +94,11 @@ Remarks values:
 - `duplicate key in schema_x.table_a`
 - `duplicate key in schema_y.table_b`
 - `matched`
+
+diff_columns format:
+- NULL if no differences or not applicable (missing/duplicate records)
+- For matched records with differences: "col1:valueA X valueB; col2:valueA X valueB"
+- Example: "price:10.50 X 12.00; status:active X inactive"
 
 ## Prerequisites
 
