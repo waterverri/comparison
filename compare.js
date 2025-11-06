@@ -183,7 +183,7 @@ UNION ALL
 
 -- Union 4: Matched records with column differences
 SELECT
-  ${joinColumns.map(col => `a.${col}`).join(', a.')},
+  ${joinColumns.map(col => `a.${col}`).join(', ')},
   'matched' AS remarks,
   ARRAY_JOIN(
     ARRAY[
