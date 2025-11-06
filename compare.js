@@ -314,6 +314,131 @@ async function downloadResults(queryExecutionId, outputFile) {
   console.log(`Results saved to: ${outputFile}`);
 }
 
+// Parse diff_columns string into a map of column -> value difference
+function parseDiffColumns(diffColumnsStr) {
+  const result = {};
+
+  if (!diffColumnsStr || diffColumnsStr.trim() === '' || diffColumnsStr === 'NULL') {
+    return result;
+  }
+
+  // Split by '; ' to get individual column differences
+  const differences = diffColumnsStr.split('; ').filter(d => d.trim() !== '');
+
+  for (const diff of differences) {
+    // Parse format: "columnName:valueA X valueB"
+    const colonIndex = diff.indexOf(':');
+    if (colonIndex === -1) continue;
+
+    const columnName = diff.substring(0, colonIndex).trim();
+    const values = diff.substring(colonIndex + 1).trim();
+
+    result[columnName] = values;
+  }
+
+  return result;
+}
+
+// Post-process CSV to expand diff_columns into separate columns
+async function expandDiffColumnsInCsv(csvFilePath, compareColumns) {
+  console.log('Expanding diff_columns into separate columns...');
+
+  const content = await fs.readFile(csvFilePath, 'utf-8');
+  const lines = content.split('\n').filter(line => line.trim() !== '');
+
+  if (lines.length === 0) {
+    console.log('No results to process.');
+    return;
+  }
+
+  // Parse CSV header
+  const headerLine = lines[0];
+  const headers = parseCSVLine(headerLine);
+
+  // Find indices
+  const diffColumnsIndex = headers.indexOf('diff_columns');
+  if (diffColumnsIndex === -1) {
+    console.log('Warning: diff_columns column not found, skipping expansion.');
+    return;
+  }
+
+  // Create new headers: remove diff_columns, add individual compare columns
+  const newHeaders = [
+    ...headers.slice(0, diffColumnsIndex),
+    ...compareColumns,
+    ...headers.slice(diffColumnsIndex + 1)
+  ];
+
+  // Process each data row
+  const newLines = [newHeaders.join(',')];
+
+  for (let i = 1; i < lines.length; i++) {
+    const fields = parseCSVLine(lines[i]);
+    if (fields.length !== headers.length) continue;
+
+    const diffColumnsValue = fields[diffColumnsIndex];
+    const diffMap = parseDiffColumns(diffColumnsValue);
+
+    // Build new row
+    const newFields = [
+      ...fields.slice(0, diffColumnsIndex),
+      ...compareColumns.map(col => {
+        const diffValue = diffMap[col];
+        if (diffValue) {
+          // Escape CSV if needed
+          return escapeCSVField(diffValue);
+        }
+        return '';
+      }),
+      ...fields.slice(diffColumnsIndex + 1)
+    ];
+
+    newLines.push(newFields.join(','));
+  }
+
+  // Write back to file
+  await fs.writeFile(csvFilePath, newLines.join('\n') + '\n', 'utf-8');
+  console.log('Diff columns expanded successfully.');
+}
+
+// Simple CSV line parser (handles quoted fields)
+function parseCSVLine(line) {
+  const fields = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+
+    if (char === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        // Escaped quote
+        current += '"';
+        i++;
+      } else {
+        // Toggle quote mode
+        inQuotes = !inQuotes;
+      }
+    } else if (char === ',' && !inQuotes) {
+      fields.push(current);
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+
+  fields.push(current);
+  return fields;
+}
+
+// Escape CSV field if needed
+function escapeCSVField(field) {
+  if (field.includes(',') || field.includes('"') || field.includes('\n')) {
+    return `"${field.replace(/"/g, '""')}"`;
+  }
+  return field;
+}
+
 // Alternative: Download results from S3 directly
 async function downloadResultsFromS3(queryExecution, outputFile) {
   const s3OutputLocation = queryExecution.ResultConfiguration.OutputLocation;
@@ -394,6 +519,9 @@ async function main() {
       console.log('S3 download failed, trying direct API download...');
       await downloadResults(queryExecutionId, outputFile);
     }
+
+    // Expand diff_columns into separate columns for easier reading
+    await expandDiffColumnsInCsv(outputFile, compareColumns);
 
     console.log('');
     console.log('Comparison completed successfully!');

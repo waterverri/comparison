@@ -67,7 +67,8 @@ This approach ensures:
 
 - **Duplicate Detection**: Uses subqueries with `COUNT(*) > 1` grouped by join columns
 - **Value Comparison**: Uses ARRAY_JOIN with IF expressions to create a condensed diff_columns output (format: "col1:valueA X valueB; col2:valueA X valueB")
-- **Query Optimization**: Changed from individual CASE columns to single diff_columns field to dramatically reduce query length for tables with many comparison columns
+- **Query Optimization**: Query uses single diff_columns field to dramatically reduce query length (avoids Athena input length limits for tables with many comparison columns)
+- **Output Post-Processing**: After download, the diff_columns field is automatically expanded into separate columns (one per compare column) for easier reading
 - **NULL Handling**: Treats NULL values as equal when comparing (`a.col = b.col OR (a.col IS NULL AND b.col IS NULL)`)
 - **Tuple Comparison Fix**: Uses `EXISTS` instead of `WHERE (columns) IN (SELECT columns)` to avoid TYPE_MISMATCH errors in Athena
 - **AWS Integration**: Uses `child_process.spawn()` to execute AWS CLI commands, parsing JSON responses
@@ -80,13 +81,14 @@ This approach ensures:
 4. Poll status every 2 seconds (max 10 minutes) via `aws athena get-query-execution`
 5. Download results from S3 (preferred) or via API
 6. Convert results to CSV and save with timestamp
+7. Post-process CSV: expand `diff_columns` into separate columns for each compare column
 
 ### Output Format
 
 CSV structure:
 - First columns: Join columns (e.g., `id`, `customer_id`)
 - Next column: `remarks` (describes the type of difference)
-- Last column: `diff_columns` (semicolon-separated list of differences)
+- Remaining columns: One column per compare column, showing the difference (e.g., `price`, `status`, `quantity`)
 
 Remarks values:
 - `missing in schema_y.table_b`
@@ -95,10 +97,12 @@ Remarks values:
 - `duplicate key in schema_y.table_b`
 - `matched`
 
-diff_columns format:
-- NULL if no differences or not applicable (missing/duplicate records)
-- For matched records with differences: "col1:valueA X valueB; col2:valueA X valueB"
-- Example: "price:10.50 X 12.00; status:active X inactive"
+Compare column format:
+- Empty cell if no difference or not applicable (missing/duplicate records)
+- For matched records with differences: "valueA X valueB" format
+- Example row: price column shows "10.50 X 12.00", status column shows "active X inactive"
+
+**Note**: The Athena query internally uses a single `diff_columns` field (to keep query length short), but the final CSV output automatically expands this into separate columns for easier reading and analysis.
 
 ## Prerequisites
 
